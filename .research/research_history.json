@@ -866,5 +866,105 @@
     "experimental_code": "import re\nimport torch\nfrom datasets import load_dataset\nfrom transformers import AutoTokenizer, AutoModelForCausalLM\n\n# -------------------------\n# Utilities\n# -------------------------\n\ndef extract_int_answer(text: str):\n    m = re.search(r\"####\\s*(-?\\d+)\", text)\n    if m:\n        return m.group(1)\n    ints = re.findall(r\"-?\\d+\", text)\n    return ints[-1] if ints else None\n\n@torch.no_grad()\ndef cot_decode_candidates(model, tok, prompt, k=10, max_new_tokens=256):\n    inp = tok(prompt, return_tensors=\"pt\").to(model.device)\n    logits = model(**inp).logits[0, -1]\n    topk = torch.topk(logits, k)\n    cand_texts = []\n    for tid in topk.indices.tolist():\n        first = torch.tensor([[tid]], device=model.device)\n        out = model.generate(\n            input_ids=torch.cat([inp[\"input_ids\"], first], dim=1),\n            attention_mask=torch.cat([inp[\"attention_mask\"], torch.ones_like(first)], dim=1),\n            max_new_tokens=max_new_tokens,\n            do_sample=False,\n        )\n        cand_texts.append(tok.decode(out[0], skip_special_tokens=True))\n    return cand_texts\n\n@torch.no_grad()\ndef answer_margin_delta(model, tok, full_text, answer_str):\n    if answer_str is None:\n        return -1e9\n    idx = full_text.rfind(answer_str)\n    if idx < 0:\n        return -1e9\n    prefix = full_text[:idx]\n    prefix_ids = tok(prefix, return_tensors=\"pt\").input_ids.to(model.device)\n    ans_ids = tok(answer_str, add_special_tokens=False, return_tensors=\"pt\").input_ids.to(model.device)\n\n    cur = prefix_ids\n    margins = []\n    for t in ans_ids[0]:\n        logits = model(input_ids=cur).logits[0, -1]\n        probs = torch.softmax(logits, dim=-1)\n        top2 = torch.topk(probs, 2).values\n        margins.append((top2[0] - top2[1]).item())\n        cur = torch.cat([cur, t.view(1, 1)], dim=1)\n    return float(sum(margins) / max(1, len(margins)))\n\n@torch.no_grad()\ndef onetoken_choice_logitdiff(model, tok, prompt, a_tok=\" A\", b_tok=\" B\"):\n    \"\"\"Return logP(A)-logP(B) at next token.\"\"\"\n    inp = tok(prompt, return_tensors=\"pt\").to(model.device)\n    logits = model(**inp).logits[0, -1]\n    a_id = tok.encode(a_tok, add_special_tokens=False)[0]\n    b_id = tok.encode(b_tok, add_special_tokens=False)[0]\n    logp = torch.log_softmax(logits, dim=-1)\n    return (logp[a_id] - logp[b_id]).item()\n\n# -------------------------\n# CoT-CCR verifier\n# -------------------------\n\nJUDGE_TEMPLATES = [\n    \"You are a strict judge. Reply only A or B.\\nQ: {q}\\n(A) {a}\\n(B) {b}\\nWhich answer is correct?\",\n    \"Choose the correct numeric answer. Reply only A or B.\\nQuestion: {q}\\nA: {a}\\nB: {b}\\nCorrect choice:\",\n]\n\nREFUTE_TEMPLATES = [\n    \"You are a skeptic. Reply only A or B.\\nQ: {q}\\n(A) {a}\\n(B) {b}\\nAssume (A) is wrong. Which is more likely correct?\",\n    \"Act as a reviewer. Reply only A or B.\\nQuestion: {q}\\nOption A: {a}\\nOption B: {b}\\nIf A were wrong, pick the more plausible correct option:\",\n]\n\n@torch.no_grad()\ndef cot_ccr_verifier(model, tok, q, a, b):\n    if a is None or b is None:\n        return 0.0, {\"J\": 0.0, \"R\": 0.0, \"C\": 0.0, \"U\": 0.0}\n\n    # Per-template diffs for variance penalty\n    diffs = []\n\n    j_scores = []\n    for t in JUDGE_TEMPLATES:\n        d = onetoken_choice_logitdiff(model, tok, t.format(q=q, a=a, b=b))\n        j_scores.append(d)\n        diffs.append(d)\n    J = sum(j_scores) / len(j_scores)\n\n    r_scores = []\n    for t in REFUTE_TEMPLATES:\n        # want B over A under refutation assumption => logP(B)-logP(A) = -(logP(A)-logP(B))\n        d = -onetoken_choice_logitdiff(model, tok, t.format(q=q, a=a, b=b))\n        r_scores.append(d)\n        diffs.append(d)\n    R = sum(r_scores) / len(r_scores)\n\n    C = abs(J - R)\n    mu = sum(diffs) / len(diffs)\n    U = sum((x - mu) ** 2 for x in diffs) / max(1, (len(diffs) - 1))\n    return (J, R, C, U), {\"J\": J, \"R\": R, \"C\": C, \"U\": U}\n\n# -------------------------\n# Main experiment (smoke test)\n# -------------------------\n\ndef run_ccr(k=10, m=3, lam=1.0, gamma=0.5, tau=0.25, n_eval=50,\n            model_name=\"mistralai/Mistral-7B-Instruct-v0.2\"):\n    tok = AutoTokenizer.from_pretrained(model_name)\n    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map=\"auto\")\n\n    ds = load_dataset(\"gsm8k\", \"main\", split=f\"test[:{n_eval}]\")\n    correct = 0\n    verifier_passes = 0\n\n    for ex in ds:\n        q = ex[\"question\"].strip()\n        gold = extract_int_answer(ex[\"answer\"])\n        prompt = f\"Q: {q}\\nA:\"  # no explicit CoT prompt\n\n        cands = cot_decode_candidates(model, tok, prompt, k=k)\n        scored = []\n        for txt in cands:\n            a = extract_int_answer(txt)\n            d = answer_margin_delta(model, tok, txt, a)\n            scored.append((d, txt, a))\n\n        scored.sort(key=lambda x: x[0], reverse=True)\n\n        # Precompute best challenger per answer among candidate set\n        # Challenger for a is the highest-Δ candidate with a different extracted answer.\n        answers_by_delta = [(d, a) for (d, _, a) in scored if a is not None]\n\n        def best_challenger(a0):\n            for d, a in answers_by_delta:\n                if a != a0:\n                    return a\n            return None\n\n        cache = {}  # (a,b) -> V\n        reranked = []\n        for rank, (d, _, a) in enumerate(scored):\n            if rank >= m or a is None:\n                V = 0.0\n            else:\n                b = best_challenger(a)\n                key = (a, b)\n                if key not in cache:\n                    (J, R, C, U), _diag = cot_ccr_verifier(model, tok, q, a, b)\n                    V = 0.5 * (J + R) - gamma * C - tau * U\n                    cache[key] = V\n                    verifier_passes += (len(JUDGE_TEMPLATES) + len(REFUTE_TEMPLATES))\n                V = cache[key]\n            S = d + lam * V\n            reranked.append((S, a))\n\n        a_best = max(reranked, key=lambda x: x[0])[1]\n        correct += int(a_best == gold)\n\n    return {\n        \"accuracy\": correct / len(ds),\n        \"verifier_forward_passes\": verifier_passes / len(ds),\n    }\n\n# Example:\n# print(run_ccr(n_eval=50, lam=1.0, gamma=0.5, tau=0.25))\n",
     "expected_result": "On GSM8K with k=10, m=3 using a 7B instruct model:\n- CoT-decoding (Δ only): ~28–38% accuracy.\n- CoT-DRC (dual-role yes/no): ~32–44%.\n- **CoT-CCR (proposed)**: ~34–46% (≈ +3 to +8 points over Δ-only; ≈ +1 to +3 points over CoT-DRC).\n\nKey diagnostic expectations:\n- High-confidence error rate (wrong among cases where selected candidate’s Δ is above its median) decreases by ~15–30% relative vs Δ-only, because wrong-but-confident candidates are more likely to lose in pairwise comparison to a challenger or exhibit high conflict (C/U) and be downweighted.\n- Average verifier forward passes stay modest: only top-m candidates are verified and each uses 4 one-token passes (2 judge + 2 refute templates) → typically ~4–8 passes/question after caching.\n- Robustness: the gain transfers better to SVAMP than yes/no verification (smaller drop from GSM8K), because relative A-vs-B judgments are less prompt-calibration dependent.\n\nHigher is better for accuracy; lower is better for high-confidence error rate and verifier_forward_passes.",
     "expected_conclusion": "A more human-like improvement to Chain-of-Thought decoding is not only “verify my answer,” but **“compare my answer against a serious alternative, and treat internal disagreement as a warning.”** CoT-CCR implements this metacognitive routine at decoding time by (i) mining a challenger answer from other latent reasoning paths, (ii) performing *contrastive* dual-role verification (judge + falsifier) via cheap one-token multiple-choice scoring, and (iii) penalizing role/template instability as an operational measure of metacognitive conflict.\n\nAcademically, this refines the contribution beyond CoT-DRC by turning verification into a *relative decision* (A vs B) and adding a measurable conflict penalty—directly targeting same-model self-agreement and prompt sensitivity with a principled, low-cost mechanism that can be ablated.\n\nPractically and socially, the method aims to reduce confidently wrong selections under tight compute budgets—valuable for tutoring, customer support, and assistive tools where the primary harm is persuasive incorrectness—and it remains training-free, model-agnostic, and testable with a single Python script."
+  },
+  "experimental_design": {
+    "experiment_summary": "Task: solve grade-school math word problems by generating a free-form solution and extracting a final numeric answer; the system must select the most likely-correct answer among multiple candidate completions produced by the same LLM at inference time.\n\nPurpose: demonstrate that the proposed inference-time reranker CoT-CCR reduces “confidently wrong” selections compared to standard CoT-decoding selection by answer-margin (Δ) alone. CoT-CCR replaces absolute self-verification with pairwise alternative-hypothesis comparison (candidate vs challenger) and explicitly penalizes metacognitive conflict (role/template instability).\n\nWorkflow (all inference-only):\n1) Candidate generation (shared across methods): For each question, run CoT-decoding-style branching on the first generated token (top-k at the first step), then greedy-complete each branch to a max length. This yields k candidate full outputs.\n2) Answer extraction: Parse each candidate’s final integer answer (robust regex + last-number fallback). Deduplicate candidates by extracted answer.\n3) Baseline scoring: Compute Δ_i (answer-margin) for each candidate i (token-level average top1–top2 probability margin over the answer tokens).\n4) Proposed CoT-CCR reranking (only for the top-m candidates by Δ to control cost):\n   - Challenger mining: for each candidate answer a, pick challenger b as the highest-Δ candidate with a different extracted answer.\n   - Contrastive dual-role pairwise verification: using the same LLM, score whether A(=a) beats B(=b) via one-token multiple-choice logits under (i) Judge prompts and (ii) Refuter prompts, each averaged over a small prompt-template ensemble.\n   - Conflict penalties: compute role conflict C=|J−R| and template sensitivity U=Var(per-template logit-diffs).\n   - Verifier score: V = 0.5*(J+R) − γ*C − τ*U.\n   - Final score: S_i = Δ_i + λ*V_i for top-m, otherwise S_i=Δ_i.\n5) Selection: choose candidate with max S_i; compare extracted answer to gold.\n\nScale fit to Runner (single A100/H200 ≥80GB):\n- Model size: 7B instruct model fits comfortably in 80GB (bf16/fp16) with room for KV cache.\n- Inference budget controls: k=10 candidates, m=3 verified candidates/question; verifier uses only one-token scoring and a 2×2 template ensemble (≈4 forward passes per (a,b) pair) with caching across duplicated (q,a,b).\n- Evaluation: full GSM8K test (1319 questions) is feasible on the provided GPU; hyperparameters (λ,γ,τ) tuned on a 200-example dev slice drawn from GSM8K train (no training, only reranker parameter selection).",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA A100 or H200, VRAM: 80 GB or more, RAM: 2048 GB or more"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "Correctness criteria: a prediction is correct if the extracted final integer answer equals the gold integer answer after normalization (strip whitespace/commas; handle optional leading sign). If extraction fails (no integer found), mark incorrect.\n\nCalculation method: accuracy = (1/N) * Σ_{i=1..N} 𝟙[ŷ_i == y_i]. Report on GSM8K test; optionally also report on dev for tuning but do not tune on test.\n\nTask appropriateness: GSM8K has a single unambiguous numeric answer; accuracy directly measures end-task success independent of explanation style.\n\nRelevant visualizations: (i) bar chart of accuracy by method; (ii) accuracy vs. Δ-bin plot (e.g., quintiles of selected candidate Δ) to show performance at different confidence levels."
+      },
+      {
+        "name": "high_confidence_error_rate",
+        "description": "Correctness criteria: same as accuracy, but computed on a high-confidence subset.\n\nCalculation method:\n1) For each question, after selection, record Δ_sel (the Δ of the selected candidate).\n2) Define a threshold t as the median of {Δ_sel} over the evaluation set (or a fixed percentile such as 75th; must be specified in the run config).\n3) High-confidence set H = {i : Δ_sel(i) ≥ t}.\n4) high_confidence_error_rate = (1/|H|) * Σ_{i∈H} 𝟙[ŷ_i != y_i].\n\nTask appropriateness: targets the core failure mode in the hypothesis—persuasive, high-confidence mistakes.\n\nRelevant visualizations: (i) error rate vs. Δ_sel quantile curve; (ii) reliability-style plot with Δ_sel bins showing fraction correct (not a probability calibration curve, but a confidence-proxy curve)."
+      },
+      {
+        "name": "verifier_forward_passes_per_question",
+        "description": "Correctness criteria: not an accuracy measure; this is a cost metric.\n\nCalculation method: count the number of verifier model forward passes used for reranking (one forward pass per judge/refuter template per (q,a,b) pair) including all cached/memoized calls actually executed. Divide by number of evaluated questions.\n\nTask appropriateness: the method claims “low-budget” inference-time improvements; this metric quantifies added compute.\n\nRelevant visualizations: (i) bar chart of average forward passes/question by method; (ii) histogram of passes/question to show tail cases with many unique (a,b) comparisons."
+      },
+      {
+        "name": "conflict_rate_selected",
+        "description": "Correctness criteria: define a ‘conflict event’ when the selected answer’s verifier diagnostics indicate instability.\n\nCalculation method:\n1) For the finally selected candidate (if it was in top-m and had a challenger), compute role conflict C=|J−R| and template variance U.\n2) Choose thresholds C0 and U0 on the dev slice (e.g., C0 = 75th percentile of C on dev; U0 = 75th percentile of U on dev) and freeze them.\n3) conflict_rate_selected = (1/N_valid) * Σ 𝟙[(C≥C0) OR (U≥U0)], where N_valid counts questions where verifier was applicable (a challenger existed and selection was among verified candidates).\n\nTask appropriateness: operationalizes the hypothesis that internal disagreement is a warning sign; CoT-CCR should reduce selecting answers with high conflict.\n\nRelevant visualizations: (i) scatter plot of (C,U) for selected answers colored by correctness; (ii) conflict rate bars by method."
+      }
+    ],
+    "models_to_use": [
+      "mistralai/Mistral-7B-Instruct-v0.2 (7B parameters)"
+    ],
+    "datasets_to_use": [
+      "openai/gsm8k (main)"
+    ],
+    "proposed_method": {
+      "method_name": "CoT-CCR (Chain-of-Thought with Contrastive Consistency Refutation)",
+      "description": "Inference-time reranking for CoT-decoding that forces explicit alternative-hypothesis comparison. For each high-Δ candidate answer a, mine a concrete challenger answer b from other candidates, then do pairwise one-token multiple-choice verification under two roles (Judge and Refuter) and a small template ensemble. Penalize metacognitive conflict via role disagreement |J−R| and template sensitivity Var(diffs). Rerank with S = Δ + λ·V where V = 0.5(J+R) − γ|J−R| − τVar.",
+      "optuna_config": {
+        "enabled": true,
+        "n_trials": 20,
+        "search_spaces": [
+          {
+            "param_name": "lambda",
+            "distribution_type": "categorical",
+            "choices": [
+              0,
+              0.5,
+              1,
+              2,
+              4
+            ]
+          },
+          {
+            "param_name": "gamma",
+            "distribution_type": "categorical",
+            "choices": [
+              0,
+              0.25,
+              0.5,
+              1
+            ]
+          },
+          {
+            "param_name": "tau",
+            "distribution_type": "categorical",
+            "choices": [
+              0,
+              0.25,
+              0.5
+            ]
+          },
+          {
+            "param_name": "k",
+            "distribution_type": "categorical",
+            "choices": [
+              5,
+              10
+            ]
+          },
+          {
+            "param_name": "m",
+            "distribution_type": "categorical",
+            "choices": [
+              1,
+              3
+            ]
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "CoT-decoding (Δ-only selection)",
+        "description": "Standard inference-time CoT-decoding reranker: generate k candidates via top-k first-token branching + greedy completion, compute answer-margin Δ for each candidate, and select the candidate with highest Δ. No verification stage; serves as the main baseline for assessing whether contrastive verification and conflict penalties reduce confident mistakes.",
+        "optuna_config": {
+          "enabled": false,
+          "n_trials": 20
+        }
+      }
+    ]
   }
 }
